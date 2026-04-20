@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__supabase__list_tables",
+      "mcp__supabase__apply_migration",
+      "Bash(npm run *)",
+      "Bash(curl -s http://localhost:4000/api/sessions)",
+      "Bash(curl -s http://localhost:4000/api/sessions -H \"Authorization: Bearer test\")",
+      "Bash(npx tsc *)",
+      "mcp__supabase__get_advisors",
+      "mcp__supabase__execute_sql",
+      "mcp__supabase__get_logs",
+      "Bash(pkill -f \"ts-node-dev\")",
+      "Bash(curl -s http://localhost:4000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"jjlmswwh@gmail.com\",\"password\":\"Test123456\"}')",
+      "Bash(curl -s http://localhost:4000/api/sessions -H \"Authorization: Bearer $\\(curl -s http://localhost:4000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"jjlmswwh@gmail.com\",\"password\":\"Test123456\"}')",
+      "Bash(curl -s \"https://generativelanguage.googleapis.com/v1beta/models?key=AIzaSyDO_2rdeA2Q6AzMY5rrSuynsqpzmPK-0z4\")",
+      "Bash(npx ts-node -e ' *)",
+      "Bash(node -e ' *)",
+      "Bash(pkill -f \"ts-node\")",
+      "Bash(node_modules/.bin/ts-node-dev --respawn src/index.ts)",
+      "Bash(/Users/apple/Desktop/code/Personal_treehole/node_modules/.bin/ts-node-dev --respawn src/index.ts)",
+      "Read(//tmp/**)",
+      "Bash(awk '{print $1}')",
+      "Bash(tee /tmp/backend.log)",
+      "Bash(rm -f /tmp/backend.log /tmp/gemini-debug.log)",
+      "Bash(bash -c 'cd /Users/apple/Desktop/code/Personal_treehole/packages/backend && /Users/apple/Desktop/code/Personal_treehole/node_modules/.bin/ts-node-dev --respawn src/index.ts 2>&1 | tee /tmp/backend.log &')",
+      "Bash(curl -s http://localhost:4000/api/sessions -H \"Authorization: Bearer invalid\")",
+      "Bash(curl -s -X POST http://localhost:4000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"123@qq.com\",\"password\":\"Test123456\"}')",
+      "Bash(curl -s -X POST http://localhost:4000/api/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"test@test.com\",\"password\":\"Test123456\"}')",
+      "Bash(curl -s -X POST http://localhost:4000/api/auth/signup -H 'Content-Type: application/json' -d '{\"email\":\"test2@test.com\",\"password\":\"Test123456\"}')",
+      "WebFetch(domain:minimax-algeng-chat-tts.oss-cn-wulanchabu.aliyuncs.com)",
+      "Bash(pkill -f \"ts-node-dev.*src/index.ts\")"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "supabase"
+  ]
+}

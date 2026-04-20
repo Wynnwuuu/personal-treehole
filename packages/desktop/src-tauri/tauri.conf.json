@@ -1,0 +1,24 @@
+{
+  "package": {
+    "productName": "Personal Treehole",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "bundle": {
+      "identifier": "com.personal.treehole"
+    },
+    "security": {
+      "csp": null
+    },
+    "allowlist": {
+      "all": true
+    },
+    "windows": [
+      {
+        "title": "Personal Treehole",
+        "width": 900,
+        "height": 700
+      }
+    ]
+  }
+}

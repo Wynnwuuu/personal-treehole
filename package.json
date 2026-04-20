@@ -1,0 +1,16 @@
+{
+  "name": "personal-treehole",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:backend": "cd packages/backend && npm run dev",
+    "dev:web": "cd packages/web && npm run dev",
+    "dev:desktop": "cd packages/desktop && npm run dev",
+    "dev:all": "sh -c \"npm run dev:backend & npm run dev:web & npm run dev:desktop & wait\"",
+    "build:backend": "cd packages/backend && npm run build",
+    "build:web": "cd packages/web && npm run build",
+    "build:desktop": "cd packages/desktop && npm run build"
+  }
+}

@@ -1,0 +1,9 @@
+body {
+  margin: 0;
+  background: #f5f7fb;
+  color: #111827;
+}
+
+button {
+  cursor: pointer;
+}
