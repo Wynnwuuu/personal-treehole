@@ -1,10 +1,35 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { useAuth } from '../hooks/useAuth'
-import { fetchMessages, sendMessage, createSession, searchMessages, updateMessage, SearchResult, Message } from '../lib/api'
+import { fetchMessages, sendMessage, createSession, searchMessages, updateMessage, editMessage, SearchResult, Message } from '../lib/api'
 
 const SESSION_KEY = 'personal-treehole-session-id'
+
+// 情绪标签淡入动画组件
+function MoodTag({ children, delay = 0, isEvent = false }: { children: React.ReactNode, delay?: number, isEvent?: boolean }) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const timer = setTimeout(() => setVisible(true), delay)
+    return () => clearTimeout(timer)
+  }, [delay])
+  return (
+    <span style={{
+      padding: '2px 8px',
+      borderRadius: 6,
+      backgroundColor: isEvent ? '#1F3D33' : '#00D2A0',
+      color: isEvent ? '#00D2A0' : '#0D0D0D',
+      fontSize: 10,
+      fontWeight: 500,
+      opacity: visible ? 1 : 0,
+      transform: visible ? 'translateY(0)' : 'translateY(4px)',
+      transition: 'opacity 0.3s ease-out, transform 0.3s ease-out'
+    }}>
+      {children}
+    </span>
+  )
+}
 
 // 注入全局动画样式
 function useGlobalStyles() {
@@ -23,6 +48,20 @@ function useGlobalStyles() {
       @keyframes spin {
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes glow {
+        0%, 100% { text-shadow: none; }
+        50% { text-shadow: 0 0 12px rgba(0, 210, 160, 0.6), 0 0 24px rgba(0, 210, 160, 0.3), 0 0 36px rgba(0, 210, 160, 0.1); }
+      }
+      .mood-tag {
+        animation: fadeIn 0.3s ease-out forwards;
+      }
+      .glow-text {
+        animation: glow 3s ease-in-out infinite;
       }
     `
     document.head.appendChild(style)
@@ -45,6 +84,9 @@ export default function HomePage() {
   const [assistantTyping, setAssistantTyping] = useState(false)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [editingContent, setEditingContent] = useState('')
+  const [isEditing, setIsEditing] = useState(false)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const cancelRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // 初始化会话，加载历史记录
@@ -68,6 +110,55 @@ export default function HomePage() {
           const historicalMessages = await fetchMessages(storedSessionId)
           setSessionId(storedSessionId)
           setMessages(historicalMessages || [])
+
+          // 检查是否有未完成的编辑进度
+          const editProgress = localStorage.getItem('treehole-edit-progress')
+          if (editProgress) {
+            const { sessionId: editSessionId, oldMessageId, newContent } = JSON.parse(editProgress)
+            if (editSessionId === storedSessionId) {
+              // 找到对应的旧消息位置
+              const oldMsgIndex = historicalMessages.findIndex(m => m.id === oldMessageId)
+              if (oldMsgIndex !== -1) {
+                const nextAiMsg = historicalMessages[oldMsgIndex + 1]
+                // 隐藏旧消息，显示编辑后的内容和呼吸灯
+                setMessages(prev => {
+                  const filtered = prev.filter(m => m.id !== oldMessageId && m.id !== nextAiMsg?.id)
+                  return [...filtered, {
+                    id: `temp-edit-${Date.now()}`,
+                    session_id: storedSessionId,
+                    role: 'user' as const,
+                    content: newContent,
+                    created_at: new Date().toISOString()
+                  }]
+                })
+                setEditingMessageId(oldMessageId)
+                setEditingContent(newContent)
+                setAssistantTyping(true)
+
+                // 继续等待编辑结果
+                try {
+                  const { userMessage: newUserMsg, assistantMessage: newAiMsg } = await editMessage(
+                    storedSessionId,
+                    oldMessageId,
+                    newContent
+                  )
+                  localStorage.removeItem('treehole-edit-progress')
+                  setMessages(prev => {
+                    const updated = prev.filter(m => !m.id.startsWith('temp-edit-'))
+                    return [...updated, newUserMsg, newAiMsg]
+                  })
+                  setAssistantTyping(false)
+                  setEditingMessageId(null)
+                  setEditingContent('')
+                } catch (e) {
+                  console.error('恢复编辑进度失败:', e)
+                  localStorage.removeItem('treehole-edit-progress')
+                  setAssistantTyping(false)
+                }
+              }
+            }
+          }
+
           setIsInitialLoading(false)
           return
         } catch (e) {
@@ -86,9 +177,16 @@ export default function HomePage() {
     }
   }
 
+  const handleCancelGeneration = () => {
+    cancelRef.current = true
+    setIsLoading(false)
+    setAssistantTyping(false)
+  }
+
   const handleSendMessage = async () => {
     if (!inputText.trim() || !sessionId || isLoading) return
 
+    cancelRef.current = false
     const text = inputText.trim()
     setInputText('')
     setIsLoading(true)
@@ -106,18 +204,28 @@ export default function HomePage() {
     setAssistantTyping(true)
 
     try {
-      const { assistantMessage } = await sendMessage(sessionId, text)
+      const { userMessage, assistantMessage } = await sendMessage(sessionId, text)
+      if (cancelRef.current) {
+        setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
+        return
+      }
+      console.log('[DEBUG] userMessage event_data:', userMessage.event_data)
+      console.log('[DEBUG] messages will be updated with:', userMessage)
 
       setMessages(prev => {
         const filtered = prev.filter(m => m.id !== tempUserMessage.id)
-        return [...filtered, tempUserMessage, assistantMessage]
+        return [...filtered, userMessage, assistantMessage]
       })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '发送消息失败')
-      setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
+      if (!cancelRef.current) {
+        setError(err instanceof Error ? err.message : '发送消息失败')
+        setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
+      }
     } finally {
-      setIsLoading(false)
-      setAssistantTyping(false)
+      if (!cancelRef.current) {
+        setIsLoading(false)
+        setAssistantTyping(false)
+      }
     }
   }
 
@@ -134,39 +242,68 @@ export default function HomePage() {
   }
 
   const handleSaveEdit = async () => {
-    if (!editingMessageId || !editingContent.trim() || !sessionId) return
+    if (!editingMessageId || !editingContent.trim() || !sessionId || isEditing) return
+
+    setIsEditing(true)
+    setError('')
 
     try {
-      // 更新用户消息
-      const updatedUserMsg = await updateMessage(editingMessageId, editingContent.trim())
-
-      // 找到紧随其后的 AI 消息
+      // 找到当前编辑消息的位置
       const msgIndex = messages.findIndex(m => m.id === editingMessageId)
       const nextAiMsg = messages[msgIndex + 1]
+      const editedContent = editingContent.trim()
 
-      // 重新发送消息给 AI 获取新回复
-      const { assistantMessage: newAiMsg } = await sendMessage(sessionId, editingContent.trim())
+      // 保存编辑进度到 localStorage，防止刷新后丢失
+      const editProgress = {
+        sessionId,
+        oldMessageId: editingMessageId,
+        newContent: editedContent
+      }
+      localStorage.setItem('treehole-edit-progress', JSON.stringify(editProgress))
+      console.log('[DEBUG] 保存编辑进度:', editProgress)
 
-      // 更新消息列表：替换编辑的用户消息和 AI 回复
+      // 先隐藏旧消息，添加临时消息显示编辑后的内容
       setMessages(prev => {
-        const updated = [...prev]
-        // 找到原来用户消息的位置，替换
-        const userMsgIdx = updated.findIndex(m => m.id === editingMessageId)
-        if (userMsgIdx !== -1) {
-          updated[userMsgIdx] = updatedUserMsg
-        }
-        // 如果有 AI 回复，替换或添加
-        const aiMsgIdx = updated.findIndex(m => m.id === nextAiMsg?.id)
-        if (aiMsgIdx !== -1) {
-          updated[aiMsgIdx] = newAiMsg
-        }
-        return updated
+        const filtered = prev.filter(m =>
+          m.id !== editingMessageId && m.id !== nextAiMsg?.id
+        )
+        return [...filtered, {
+          id: `temp-edit-${Date.now()}`,
+          session_id: sessionId,
+          role: 'user' as const,
+          content: editedContent,
+          created_at: new Date().toISOString()
+        }]
       })
+      setAssistantTyping(true)
+
+      // 使用统一的编辑端点：标记旧数据 + 获取新 AI 回复
+      const { userMessage: newUserMsg, assistantMessage: newAiMsg } = await editMessage(
+        sessionId,
+        editingMessageId,
+        editedContent
+      )
+
+      // 清除编辑进度
+      localStorage.removeItem('treehole-edit-progress')
+      console.log('[DEBUG] 清除编辑进度')
+
+      // 替换临时消息为真实消息
+      setMessages(prev => {
+        const updated = prev.filter(m => !m.id.startsWith('temp-edit-'))
+        return [...updated, newUserMsg, newAiMsg]
+      })
+      setAssistantTyping(false)
 
       setEditingMessageId(null)
       setEditingContent('')
     } catch (err) {
+      localStorage.removeItem('treehole-edit-progress')
+      console.error('[DEBUG] 编辑失败:', err)
       setError(err instanceof Error ? err.message : '修改失败')
+      setAssistantTyping(false)
+    } finally {
+      setIsEditing(false)
     }
   }
 
@@ -186,8 +323,8 @@ export default function HomePage() {
   if (!isAuthenticated) {
     return (
       <div style={{ backgroundColor: '#0D0D0D', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
-        <h1 style={{ color: '#fff', marginBottom: 16 }}>Personal Treehole</h1>
-        <a href="/login" style={{ color: '#00D2A0' }}>去登录</a>
+        <h1 style={{ color: '#fff', marginBottom: 16 }} className="glow-text">Personal Treehole</h1>
+        <a href="/login" style={{ color: '#00D2A0', textDecoration: 'none' }}>去登录</a>
       </div>
     )
   }
@@ -209,7 +346,7 @@ export default function HomePage() {
         alignItems: 'center',
         backgroundColor: '#141414'
       }}>
-        <h1 style={{ fontSize: 16, fontWeight: 500, color: '#fff' }}>Treehole</h1>
+        <h1 style={{ fontSize: 20, fontWeight: 500, color: '#fff' }}>Treehole</h1>
         <div style={{ display: 'flex', gap: 12 }}>
           <button
             onClick={() => setSearchOpen(true)}
@@ -270,14 +407,14 @@ export default function HomePage() {
               </div>
             ) : messages.length === 0 && !isLoading && !assistantTyping ? (
               <div style={{ textAlign: 'center', paddingTop: 120 }}>
-                <p style={{ fontSize: 13, color: '#666', marginBottom: 8 }}>你好，我是你的心理健康伴侣</p>
-                <p style={{ fontSize: 12, color: '#555' }}>有什么想聊的，尽管说</p>
+                <p style={{ fontSize: 18, color: '#666', marginBottom: 8 }}>这里是你的私人树洞</p>
+                <p style={{ fontSize: 18, color: '#555' }}>今天过得好吗，我在听</p>
               </div>
             ) : null}
 
             {messages.map((msg, idx) => {
-              const isLastMessage = messages.indexOf(msg) === messages.length - 1
-              const isLastUserMessage = isLastMessage && msg.role === 'user'
+              const lastUserMessageId = messages.filter(m => m.role === 'user').pop()?.id
+              const isLastUserMessage = msg.role === 'user' && msg.id === lastUserMessageId
               return (
               <div
                 key={msg.id}
@@ -323,7 +460,7 @@ export default function HomePage() {
                         whiteSpace: 'pre-wrap'
                       }}
                     >
-                      {msg.content}
+                      <ReactMarkdown>{msg.content}</ReactMarkdown>
                     </div>
                   </div>
                 )}
@@ -368,17 +505,18 @@ export default function HomePage() {
                           </button>
                           <button
                             onClick={handleSaveEdit}
+                            disabled={isEditing}
                             style={{
                               padding: '4px 12px',
                               borderRadius: 4,
                               border: 'none',
-                              backgroundColor: '#00D2A0',
-                              color: '#0D0D0D',
+                              backgroundColor: isEditing ? '#888' : '#00D2A0',
+                              color: isEditing ? '#ccc' : '#0D0D0D',
                               fontSize: 12,
-                              cursor: 'pointer'
+                              cursor: isEditing ? 'not-allowed' : 'pointer'
                             }}
                           >
-                            保存
+                            {isEditing ? '保存中...' : '保存'}
                           </button>
                         </div>
                       </div>
@@ -446,27 +584,14 @@ export default function HomePage() {
                 {msg.role === 'user' && msg.event_data && (
                   <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {msg.event_data.mood && (
-                      <span style={{
-                        padding: '2px 8px',
-                        borderRadius: 6,
-                        backgroundColor: '#00D2A0',
-                        color: '#0D0D0D',
-                        fontSize: 10,
-                        fontWeight: 500
-                      }}>
+                      <MoodTag key={`mood-${msg.id}`} delay={0}>
                         {msg.event_data.mood}
-                      </span>
+                      </MoodTag>
                     )}
                     {msg.event_data.events_mentioned?.slice(0, 2).map((event: string, i: number) => (
-                      <span key={i} style={{
-                        padding: '2px 8px',
-                        borderRadius: 6,
-                        backgroundColor: '#1F3D33',
-                        color: '#00D2A0',
-                        fontSize: 10
-                      }}>
+                      <MoodTag key={`event-${msg.id}-${i}`} delay={(i + 1) * 100} isEvent>
                         {event}
-                      </span>
+                      </MoodTag>
                     ))}
                   </div>
                 )}
@@ -563,6 +688,26 @@ export default function HomePage() {
             >
               ▲
             </button>
+            {(isLoading || assistantTyping) && (
+              <button
+                onClick={handleCancelGeneration}
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: '50%',
+                  border: 'none',
+                  backgroundColor: '#FF6B6B',
+                  color: '#fff',
+                  fontSize: 14,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+              >
+                ■
+              </button>
+            )}
           </div>
           {error && (
             <div style={{ maxWidth: 680, margin: '8px auto 0', color: '#ff6b6b', fontSize: 12 }}>

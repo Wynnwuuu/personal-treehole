@@ -3,9 +3,11 @@ import cors from 'cors'
 import dotenv from 'dotenv'
 import { createClient } from '@supabase/supabase-js'
 import { chat, analyzeEvent } from './services/deepseek'
+import { sendEmail, generateVerifyEmailHtml, generateInvitationCode } from './services/email'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import * as path from 'path'
+import crypto from 'crypto'
 
 dotenv.config({ path: path.join(__dirname, '../.env') })
 
@@ -84,13 +86,45 @@ async function verifyToken(req: express.Request, res: express.Response, next: ex
 // ============ 认证 API ============
 
 app.post('/api/auth/signup', async (req, res) => {
-  const { email, password } = req.body
+  const { email, password, invitationCode } = req.body
+
+  // 验证必填字段
   if (!email || !password) return res.status(400).json({ error: '请填写邮箱和密码。' })
   if (!isValidEmail(email)) return res.status(400).json({ error: '邮箱格式不正确，请使用 user@example.com 这样的邮箱地址。' })
   if (!isStrongPassword(password)) return res.status(400).json({ error: '密码长度至少 8 位，建议包含字母和数字。' })
 
+  // 验证邀请码
+  if (!invitationCode) return res.status(400).json({ error: '请填写邀请码。' })
+
+  const { data: inviteData, error: inviteError } = await supabase
+    .from('invitation_codes')
+    .select('*')
+    .eq('code', invitationCode.toUpperCase())
+    .eq('is_active', true)
+    .single()
+
+  if (inviteError || !inviteData) {
+    return res.status(400).json({ error: '邀请码无效。' })
+  }
+
+  if (inviteData.current_uses >= inviteData.max_uses) {
+    return res.status(400).json({ error: '邀请码已使用次数上限。' })
+  }
+
+  if (inviteData.expires_at && new Date(inviteData.expires_at) < new Date()) {
+    return res.status(400).json({ error: '邀请码已过期。' })
+  }
+
   const passwordHash = await bcrypt.hash(password, 10)
-  const { data, error } = await supabase.from('users').insert({ email, password_hash: passwordHash }).select().single()
+  const { data, error } = await supabase
+    .from('users')
+    .insert({
+      email,
+      password_hash: passwordHash,
+      email_verified: false
+    })
+    .select()
+    .single()
 
   if (error) {
     console.error('注册错误:', error)
@@ -106,7 +140,48 @@ app.post('/api/auth/signup', async (req, res) => {
     return res.status(500).json({ error: '注册失败，请稍后重试。如果问题持续存在，请检查后端日志。' })
   }
 
-  res.json({ token: createToken(data.id) })
+  // 更新邀请码使用次数
+  await supabase
+    .from('invitation_codes')
+    .update({
+      current_uses: inviteData.current_uses + 1,
+      used_by: data.id,
+      used_at: new Date().toISOString()
+    })
+    .eq('id', inviteData.id)
+
+  // 生成邮件验证 token
+  const verifyToken = crypto.randomBytes(32).toString('hex')
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30分钟后过期 // 24小时后过期
+
+  await supabase.from('email_verify_tokens').insert({
+    user_id: data.id,
+    token: verifyToken,
+    expires_at: expiresAt
+  })
+
+  // 更新用户的验证 token
+  await supabase
+    .from('users')
+    .update({
+      email_verify_token: verifyToken,
+      email_verify_token_expires_at: expiresAt
+    })
+    .eq('id', data.id)
+
+  // 发送验证邮件
+  const { html, text } = generateVerifyEmailHtml(verifyToken)
+  await sendEmail({
+    to: email,
+    subject: '【心灵树洞】请验证您的邮箱',
+    html,
+    text
+  })
+
+  res.json({
+    token: createToken(data.id),
+    requiresEmailVerification: true
+  })
 })
 
 app.post('/api/auth/login', async (req, res) => {
@@ -117,10 +192,139 @@ app.post('/api/auth/login', async (req, res) => {
   const { data, error } = await supabase.from('users').select('*').eq('email', email).single()
   if (error || !data) return res.status(401).json({ error: '邮箱或密码不正确，请检查后重试。' })
 
+  // 检查邮箱是否已验证
+  if (!data.email_verified) {
+    return res.status(403).json({
+      error: '请先验证邮箱后再登录。验证邮件已发送至您的邮箱。',
+      requiresEmailVerification: true
+    })
+  }
+
   const match = await bcrypt.compare(password, data.password_hash)
   if (!match) return res.status(401).json({ error: '邮箱或密码不正确，请检查后重试。' })
 
   res.json({ token: createToken(data.id) })
+})
+
+// 验证邮箱
+app.get('/api/auth/verify-email', async (req, res) => {
+  const { token } = req.query
+
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: '缺少验证 token。' })
+  }
+
+  // 查询 token
+  const { data: tokenData, error: tokenError } = await supabase
+    .from('email_verify_tokens')
+    .select('*')
+    .eq('token', token)
+    .single()
+
+  if (tokenError || !tokenData) {
+    return res.status(400).json({ error: '验证链接无效或已过期。' })
+  }
+
+  if (tokenData.used_at) {
+    return res.status(400).json({ error: '此验证链接已使用。' })
+  }
+
+  if (new Date(tokenData.expires_at) < new Date()) {
+    return res.status(400).json({ error: '验证链接已过期，请重新发送验证邮件。' })
+  }
+
+  // 更新用户邮箱验证状态
+  const { error: userError } = await supabase
+    .from('users')
+    .update({
+      email_verified: true,
+      email_verify_token: null,
+      email_verify_token_expires_at: null
+    })
+    .eq('id', tokenData.user_id)
+
+  if (userError) {
+    return res.status(500).json({ error: '验证失败，请稍后重试。' })
+  }
+
+  // 标记 token 已使用
+  await supabase
+    .from('email_verify_tokens')
+    .update({ used_at: new Date().toISOString() })
+    .eq('id', tokenData.id)
+
+  res.json({ success: true, message: '邮箱验证成功！' })
+})
+
+// 重新发送验证邮件
+// 测试邮件接口（仅开发环境使用）
+app.post('/api/auth/test-email', async (req, res) => {
+  const { email } = req.body
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({ error: '请提供有效的邮箱地址。' })
+  }
+  const token = crypto.randomBytes(32).toString('hex')
+  const { html, text } = generateVerifyEmailHtml(token)
+  const sent = await sendEmail({ to: email, subject: '✧ 验证你的邮箱 ✧', html, text })
+  if (sent) {
+    res.json({ success: true, message: '测试邮件已发送' })
+  } else {
+    res.status(500).json({ error: '发送失败，请检查 Resend API 配置' })
+  }
+})
+
+app.post('/api/auth/resend-verification', async (req, res) => {
+  const { email } = req.body
+
+  if (!email || !isValidEmail(email)) {
+    return res.status(400).json({ error: '请提供有效的邮箱地址。' })
+  }
+
+  // 查找用户
+  const { data: user, error: userError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('email', email)
+    .single()
+
+  if (userError || !user) {
+    return res.status(404).json({ error: '该邮箱未注册。' })
+  }
+
+  if (user.email_verified) {
+    return res.status(400).json({ error: '该邮箱已验证，无需重复验证。' })
+  }
+
+  // 生成新 token
+  const verifyToken = crypto.randomBytes(32).toString('hex')
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30分钟后过期
+
+  // 更新用户验证 token
+  await supabase
+    .from('users')
+    .update({
+      email_verify_token: verifyToken,
+      email_verify_token_expires_at: expiresAt
+    })
+    .eq('id', user.id)
+
+  // 保存 token 记录
+  await supabase.from('email_verify_tokens').insert({
+    user_id: user.id,
+    token: verifyToken,
+    expires_at: expiresAt
+  })
+
+  // 发送验证邮件
+  const { html, text } = generateVerifyEmailHtml(verifyToken)
+  await sendEmail({
+    to: email,
+    subject: '【心灵树洞】请验证您的邮箱',
+    html,
+    text
+  })
+
+  res.json({ success: true, message: '验证邮件已发送。' })
 })
 
 // ============ 会话 API ============
@@ -179,6 +383,7 @@ app.get('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res)
     .from('entries')
     .select('*')
     .eq('session_id', sessionId)
+    .eq('is_stale', false)
     .order('created_at', { ascending: true })
 
   if (error) return res.status(400).json({ error: error.message })
@@ -211,11 +416,12 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
     return res.status(404).json({ error: '会话不存在或无权访问。' })
   }
 
-  // 获取会话历史
+  // 获取会话历史（过滤已编辑的旧数据）
   const { data: historyData } = await supabase
     .from('entries')
     .select('role, content')
     .eq('session_id', sessionId)
+    .eq('is_stale', false)
     .order('created_at', { ascending: true })
 
   console.log('[API] History data:', historyData)
@@ -347,6 +553,16 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
       })
       .eq('id', userMessage.id)
     console.log('[API] Entry update result:', updateError)
+
+    // 更新 userMessage 包含 event_data
+    userMessage.event_data = {
+      mood: eventAnalysis.mood,
+      sentiment_score: eventAnalysis.sentiment_score,
+      energy_level: eventAnalysis.energy_level,
+      stress_level: eventAnalysis.stress_level,
+      events_mentioned: eventAnalysis.events_mentioned,
+      event_timestamp: eventAnalysis.event_timestamp
+    }
   } catch (error) {
     console.error('情绪分析错误:', error)
   }
@@ -410,23 +626,223 @@ app.put('/api/entries/:id', verifyToken, async (req: AuthRequest, res) => {
     return res.status(403).json({ error: '只能修改自己的消息。' })
   }
 
-  // 更新消息内容
-  const { data: updatedEntry, error: updateError } = await supabase
+  // 标记旧消息为 stale（不再被读取）
+  await supabase
     .from('entries')
-    .update({
-      content: content.trim(),
-      updated_at: new Date().toISOString()
-    })
+    .update({ is_stale: true })
     .eq('id', entryId)
-    .eq('user_id', userId)
+
+  // 插入新消息
+  const { data: newEntry, error: insertError } = await supabase
+    .from('entries')
+    .insert({
+      user_id: userId,
+      session_id: entry.session_id,
+      content: content.trim(),
+      role: 'user',
+      user_timestamp: new Date().toISOString(),
+      event_timestamp: new Date().toISOString()
+    })
     .select()
     .single()
 
-  if (updateError) return res.status(400).json({ error: updateError.message })
-  res.json(updatedEntry)
+if (insertError) return res.status(400).json({ error: insertError.message })
+  res.json(newEntry)
 })
 
-// ============ 情绪 API ===========
+// 编辑消息并获取新 AI 回复
+app.post('/api/sessions/:id/edit', verifyToken, async (req: AuthRequest, res) => {
+  const userId = req.body.userId
+  const sessionId = req.params.id
+  const { entryId, content } = req.body
+
+  if (!content?.trim()) {
+    return res.status(400).json({ error: '消息内容不能为空。' })
+  }
+
+  // 验证消息属于该用户
+  const { data: entry, error: fetchError } = await supabase
+    .from('entries')
+    .select('id, user_id, role, session_id')
+    .eq('id', entryId)
+    .eq('user_id', userId)
+    .single()
+
+  if (fetchError || !entry) {
+    return res.status(404).json({ error: '消息不存在或无权修改。' })
+  }
+
+  if (entry.role !== 'user') {
+    return res.status(403).json({ error: '只能修改自己的消息。' })
+  }
+
+  // 查找紧随其后的 AI 消息（在标记为 stale 之前查询）
+  const { data: allEntries } = await supabase
+    .from('entries')
+    .select('id, role')
+    .eq('session_id', sessionId)
+    .eq('is_stale', false)
+    .order('created_at', { ascending: true })
+
+  const entryIndex = allEntries?.findIndex(e => e.id === entryId) ?? -1
+  const nextEntry = allEntries?.[entryIndex + 1]
+
+  // 标记旧用户消息和紧随的 AI 消息为 stale
+  const entriesToMarkStale = [entryId]
+  if (nextEntry?.role === 'assistant') {
+    entriesToMarkStale.push(nextEntry.id)
+  }
+
+  await supabase
+    .from('entries')
+    .update({ is_stale: true })
+    .in('id', entriesToMarkStale)
+
+  // 清理关联的 mood 数据（这些事件已不再有效）
+  await supabase
+    .from('moods')
+    .delete()
+    .in('entry_id', entriesToMarkStale)
+
+  // 获取情绪上下文
+  const oneWeekAgo = new Date()
+  oneWeekAgo.setDate(oneWeekAgo.getDate() - 7)
+
+  const [allMoods, recentMoods] = await Promise.all([
+    supabase.from('moods').select('events_mentioned, entry_id').eq('user_id', userId),
+    supabase
+      .from('moods')
+      .select('sentiment_score, energy_level, stress_level')
+      .eq('user_id', userId)
+      .gte('created_at', oneWeekAgo.toISOString())
+  ])
+
+  // 过滤 stale 关联的事件
+  const validEntryIds = new Set(
+    (allEntries || []).filter(e => !allEntries?.some(s => s.id === e.id)).map(e => e.id)
+  )
+  const allEvents: string[] = []
+  if (allMoods.data) {
+    allMoods.data.forEach(m => {
+      if (!m.entry_id || validEntryIds.has(m.entry_id)) {
+        if (m.events_mentioned) allEvents.push(...m.events_mentioned)
+      }
+    })
+  }
+
+  let avgSentiment = 0.5, avgEnergy = 0.5, avgStress = 0.5
+  if (recentMoods.data && recentMoods.data.length > 0) {
+    avgSentiment = recentMoods.data.reduce((s, m) => s + m.sentiment_score, 0) / recentMoods.data.length
+    avgEnergy = recentMoods.data.reduce((s, m) => s + m.energy_level, 0) / recentMoods.data.length
+    avgStress = recentMoods.data.reduce((s, m) => s + m.stress_level, 0) / recentMoods.data.length
+  }
+
+  const moodContext = {
+    events_mentioned: [...new Set(allEvents)],
+    sentiment_score: avgSentiment,
+    energy_level: avgEnergy,
+    stress_level: avgStress
+  }
+
+  // 插入新用户消息
+  const { data: newUserMsg, error: userMsgError } = await supabase
+    .from('entries')
+    .insert({
+      user_id: userId,
+      session_id: sessionId,
+      content: content.trim(),
+      role: 'user',
+      user_timestamp: new Date().toISOString(),
+      event_timestamp: new Date().toISOString()
+    })
+    .select()
+    .single()
+
+  if (userMsgError) return res.status(400).json({ error: userMsgError.message })
+
+  // 获取非 stale 的会话历史
+  const { data: historyData } = await supabase
+    .from('entries')
+    .select('role, content')
+    .eq('session_id', sessionId)
+    .eq('is_stale', false)
+    .order('created_at', { ascending: true })
+
+  const sessionHistory = (historyData || []).map((e: any) => ({
+    role: e.role as 'user' | 'assistant',
+    content: e.content
+  }))
+
+  // 调用 AI
+  const recentHistory = sessionHistory.slice(-20)
+  let aiResponse = ''
+  try {
+    aiResponse = await chat(recentHistory, content, moodContext)
+  } catch (error) {
+    console.error('[API] AI 对话错误:', error)
+    aiResponse = '抱歉，我现在无法回应你，请稍后再试。'
+  }
+
+  // 存储新 AI 回复
+  const { data: assistantMsg, error: assistantMsgError } = await supabase
+    .from('entries')
+    .insert({
+      user_id: userId,
+      session_id: sessionId,
+      content: aiResponse,
+      role: 'assistant'
+    })
+    .select()
+    .single()
+
+  if (assistantMsgError) return res.status(400).json({ error: assistantMsgError.message })
+
+  // 情绪分析
+  try {
+    const eventAnalysis = await analyzeEvent(content)
+    await supabase.from('moods').insert({
+      entry_id: newUserMsg.id,
+      user_id: userId,
+      sentiment_score: eventAnalysis.sentiment_score,
+      primary_mood: eventAnalysis.mood,
+      mood_tags: eventAnalysis.events_mentioned,
+      energy_level: eventAnalysis.energy_level,
+      stress_level: eventAnalysis.stress_level,
+      events_mentioned: eventAnalysis.events_mentioned,
+      event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+    })
+    await supabase
+      .from('entries')
+      .update({
+        event_data: {
+          mood: eventAnalysis.mood,
+          sentiment_score: eventAnalysis.sentiment_score,
+          energy_level: eventAnalysis.energy_level,
+          stress_level: eventAnalysis.stress_level,
+          events_mentioned: eventAnalysis.events_mentioned,
+          event_timestamp: eventAnalysis.event_timestamp
+        },
+        event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+      })
+      .eq('id', newUserMsg.id)
+  } catch (error) {
+    console.error('情绪分析错误:', error)
+  }
+
+  // 更新 newUserMsg 包含 event_data
+  const { data: updatedUserMsg } = await supabase
+    .from('entries')
+    .select('*')
+    .eq('id', newUserMsg.id)
+    .single()
+
+  res.json({
+    userMessage: updatedUserMsg || newUserMsg,
+    assistantMessage: assistantMsg
+  })
+})
+
+// ============ 情绪 API ============
 
 app.get('/api/moods', verifyToken, async (req: AuthRequest, res) => {
   const userId = req.body.userId
