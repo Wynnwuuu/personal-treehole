@@ -54,6 +54,7 @@ export interface Message {
 
 export interface AuthResponse {
   token: string
+  requiresEmailVerification?: boolean
 }
 
 export function getStoredToken() {
@@ -119,10 +120,17 @@ export async function login(email: string, password: string) {
   })
 }
 
-export async function signup(email: string, password: string) {
-  return apiFetch<AuthResponse>('/api/auth/signup', {
+export async function signup(email: string, password: string, invitationCode?: string) {
+  return apiFetch<AuthResponse & { requiresEmailVerification?: boolean }>('/api/auth/signup', {
     method: 'POST',
-    body: JSON.stringify({ email, password })
+    body: JSON.stringify({ email, password, invitationCode })
+  })
+}
+
+export async function resendVerification(email: string) {
+  return apiFetch<{ success: boolean }>('/api/auth/resend-verification', {
+    method: 'POST',
+    body: JSON.stringify({ email })
   })
 }
 
@@ -193,6 +201,16 @@ export async function updateMessage(id: string, content: string): Promise<Messag
   return apiFetch<Message>(`/api/entries/${id}`, {
     method: 'PUT',
     body: JSON.stringify({ content })
+  })
+}
+
+export async function editMessage(sessionId: string, entryId: string, content: string): Promise<{
+  userMessage: Message
+  assistantMessage: Message
+}> {
+  return apiFetch(`/api/sessions/${sessionId}/edit`, {
+    method: 'POST',
+    body: JSON.stringify({ entryId, content })
   })
 }
 
