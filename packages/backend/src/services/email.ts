@@ -3,8 +3,6 @@ import * as path from 'path'
 
 dotenv.config({ path: path.join(__dirname, '../.env') })
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
-const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@resend.dev'
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000'
 
 const TENCENT_SECRET_ID = process.env.TENCENT_SECRET_ID || ''
@@ -21,44 +19,17 @@ interface SendEmailParams {
 }
 
 export async function sendEmail({ to, subject, html, text, templateData }: SendEmailParams): Promise<boolean> {
-  if (templateData && TENCENT_SECRET_ID && TENCENT_SECRET_KEY && TENCENT_SES_SENDER_EMAIL && TENCENT_SES_TEMPLATE_ID) {
-    return sendViaTencentSES(to, subject, templateData)
-  }
-
-  if (!RESEND_API_KEY) {
-    console.warn('[Email] RESEND_API_KEY not configured, skipping email send')
-    console.log('[Email] Would have sent:', { to, subject })
-    return false
-  }
-
-  try {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${RESEND_API_KEY}`
-      },
-      body: JSON.stringify({
-        from: EMAIL_FROM,
-        to,
-        subject,
-        html,
-        text
-      })
+  if (!TENCENT_SECRET_ID || !TENCENT_SECRET_KEY || !TENCENT_SES_SENDER_EMAIL || !TENCENT_SES_TEMPLATE_ID) {
+    console.error('[Email] Tencent SES configuration incomplete:', {
+      hasSecretId: !!TENCENT_SECRET_ID,
+      hasSecretKey: !!TENCENT_SECRET_KEY,
+      hasSenderEmail: !!TENCENT_SES_SENDER_EMAIL,
+      hasTemplateId: !!TENCENT_SES_TEMPLATE_ID
     })
-
-    if (!response.ok) {
-      const error = await response.text()
-      console.error('[Email] Send failed:', response.status, error)
-      return false
-    }
-
-    console.log('[Email] Sent successfully to:', to)
-    return true
-  } catch (error) {
-    console.error('[Email] Send error:', error)
     return false
   }
+
+  return sendViaTencentSES(to, subject, templateData || { name: '用户' })
 }
 
 async function sendViaTencentSES(to: string, subject: string, templateData: Record<string, string>): Promise<boolean> {
@@ -71,7 +42,7 @@ async function sendViaTencentSES(to: string, subject: string, templateData: Reco
       secretId: TENCENT_SECRET_ID,
       secretKey: TENCENT_SECRET_KEY
     },
-    region: 'ap-hongkong'
+    region: 'ap-guangzhou'
   })
 
   try {
@@ -151,7 +122,7 @@ ${verifyUrl}
 
 此链接有效期为 30 分钟。
 
-若未注册过 Personal Treehole，请忽略这封邮件。
+若未注册过 Personal Treehole，请忽略此邮件。
 
 —— 树洞守护者 ——`
 

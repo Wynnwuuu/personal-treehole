@@ -198,9 +198,10 @@ export function sendMessageStream(sessionId: string, content: string, callbacks:
 
       const decoder = new TextDecoder()
       let buffer = ''
+      const streamReader = reader
 
       function read() {
-        reader.read().then(({ done, value }) => {
+        streamReader.read().then(({ done, value }) => {
           if (done) {
             callbacks.onDone?.()
             return
