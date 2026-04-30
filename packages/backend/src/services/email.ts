@@ -1,7 +1,7 @@
 import dotenv from 'dotenv'
 import * as path from 'path'
 
-dotenv.config({ path: path.join(__dirname, '../../.env') })
+dotenv.config({ path: path.join(__dirname, '../.env') })
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@resend.dev'
