@@ -167,6 +167,86 @@ export async function sendMessage(sessionId: string, content: string): Promise<{
   })
 }
 
+export function sendMessageStream(sessionId: string, content: string, callbacks: {
+  onUserMessage?: (message: Message) => void
+  onChunk?: (chunk: string) => void
+  onAssistantMessage?: (message: Message) => void
+  onError?: (error: string) => void
+  onDone?: () => void
+}): () => void {
+  const token = getStoredToken()
+  const abortController = new AbortController()
+
+  fetch(`${API_BASE_URL}/api/sessions/${sessionId}/messages/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify({ content }),
+    signal: abortController.signal
+  })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(response.statusText)
+      }
+      const reader = response.body?.getReader()
+      if (!reader) {
+        callbacks.onError?.('No response body')
+        return
+      }
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      function read() {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            callbacks.onDone?.()
+            return
+          }
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                if (data.type === 'userMessage') {
+                  callbacks.onUserMessage?.(data.data)
+                } else if (data.type === 'chunk') {
+                  callbacks.onChunk?.(data.data)
+                } else if (data.type === 'assistantMessage') {
+                  callbacks.onAssistantMessage?.(data.data)
+                } else if (data.type === 'error') {
+                  callbacks.onError?.(data.data)
+                } else if (data === '[DONE]') {
+                  callbacks.onDone?.()
+                }
+              } catch (e) {
+                // Skip invalid JSON
+              }
+            }
+          }
+          read()
+        })
+      }
+
+      read()
+    })
+    .catch(error => {
+      if (error.name === 'AbortError') {
+        callbacks.onDone?.()
+      } else {
+        callbacks.onError?.(error.message)
+      }
+    })
+
+  return () => abortController.abort()
+}
+
 // ============ 搜索 API ===========
 
 export interface SearchResult {

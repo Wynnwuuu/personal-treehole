@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { useAuth } from '../hooks/useAuth'
-import { fetchMessages, sendMessage, createSession, searchMessages, updateMessage, editMessage, SearchResult, Message } from '../lib/api'
+import { fetchMessages, sendMessage, sendMessageStream, createSession, searchMessages, updateMessage, editMessage, SearchResult, Message } from '../lib/api'
 
 const SESSION_KEY = 'personal-treehole-session-id'
 
@@ -42,8 +43,8 @@ function useGlobalStyles() {
         50% { transform: scale(1); opacity: 1; }
       }
       @keyframes dotPulse {
-        0%, 100% { opacity: 0.2; }
-        50% { opacity: 1; }
+        0%, 100% { opacity: 0.15; transform: scale(0.85); }
+        50% { opacity: 1; transform: scale(1.15); }
       }
       @keyframes spin {
         from { transform: rotate(0deg); }
@@ -54,14 +55,14 @@ function useGlobalStyles() {
         to { opacity: 1; transform: translateY(0); }
       }
       @keyframes glow {
-        0%, 100% { text-shadow: none; }
-        50% { text-shadow: 0 0 12px rgba(0, 210, 160, 0.6), 0 0 24px rgba(0, 210, 160, 0.3), 0 0 36px rgba(0, 210, 160, 0.1); }
+        0%, 100% { text-shadow: 0 0 4px rgba(0, 210, 160, 0.2), 0 0 8px rgba(0, 210, 160, 0.1); opacity: 0.7; transform: scale(0.98); }
+        50% { text-shadow: 0 0 20px rgba(0, 210, 160, 0.8), 0 0 40px rgba(0, 210, 160, 0.5), 0 0 60px rgba(0, 210, 160, 0.3); opacity: 1; transform: scale(1.02); }
       }
       .mood-tag {
         animation: fadeIn 0.3s ease-out forwards;
       }
       .glow-text {
-        animation: glow 3s ease-in-out infinite;
+        animation: glow 2s ease-in-out infinite;
       }
     `
     document.head.appendChild(style)
@@ -86,6 +87,7 @@ export default function HomePage() {
   const [editingContent, setEditingContent] = useState('')
   const [isEditing, setIsEditing] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [streamingContent, setStreamingContent] = useState('')
   const cancelRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -179,8 +181,13 @@ export default function HomePage() {
 
   const handleCancelGeneration = () => {
     cancelRef.current = true
+    if ((window as any).__cancelStream) {
+      ;(window as any).__cancelStream()
+      ;(window as any).__cancelStream = null
+    }
     setIsLoading(false)
     setAssistantTyping(false)
+    setStreamingContent('')
   }
 
   const handleSendMessage = async () => {
@@ -191,6 +198,7 @@ export default function HomePage() {
     setInputText('')
     setIsLoading(true)
     setError('')
+    setStreamingContent('')
 
     const tempUserMessage: Message = {
       id: `temp-${Date.now()}`,
@@ -203,30 +211,46 @@ export default function HomePage() {
 
     setAssistantTyping(true)
 
-    try {
-      const { userMessage, assistantMessage } = await sendMessage(sessionId, text)
-      if (cancelRef.current) {
-        setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
-        return
-      }
-      console.log('[DEBUG] userMessage event_data:', userMessage.event_data)
-      console.log('[DEBUG] messages will be updated with:', userMessage)
+    let userMessageResult: Message | null = null
+    let assistantMessageResult: Message | null = null
 
-      setMessages(prev => {
-        const filtered = prev.filter(m => m.id !== tempUserMessage.id)
-        return [...filtered, userMessage, assistantMessage]
-      })
-    } catch (err) {
-      if (!cancelRef.current) {
-        setError(err instanceof Error ? err.message : '发送消息失败')
-        setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
-      }
-    } finally {
-      if (!cancelRef.current) {
+    const cleanup = sendMessageStream(sessionId, text, {
+      onUserMessage: (msg) => {
+        userMessageResult = msg
+        setMessages(prev => {
+          const filtered = prev.filter(m => m.id !== tempUserMessage.id)
+          return [...filtered, msg]
+        })
+      },
+      onChunk: (chunk) => {
+        setStreamingContent(prev => prev + chunk)
+      },
+      onAssistantMessage: (msg) => {
+        assistantMessageResult = msg
+      },
+      onError: (errorMsg) => {
+        if (!cancelRef.current) {
+          setError(errorMsg)
+          setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
+        }
+      },
+      onDone: () => {
+        if (cancelRef.current) {
+          setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
+        } else if (assistantMessageResult) {
+          setMessages(prev => {
+            const filtered = prev.filter(m => m.id !== tempUserMessage.id)
+            return [...filtered, assistantMessageResult!]
+          })
+        }
         setIsLoading(false)
         setAssistantTyping(false)
+        setStreamingContent('')
       }
-    }
+    })
+
+    // 保存取消函数
+    ;(window as any).__cancelStream = cleanup
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -460,7 +484,7 @@ export default function HomePage() {
                         whiteSpace: 'pre-wrap'
                       }}
                     >
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                     </div>
                   </div>
                 )}
@@ -602,9 +626,9 @@ export default function HomePage() {
               </div>
             )})}
 
-            {/* AI 正在输入 */}
+            {/* AI 正在输入 / 流式输出 */}
             {assistantTyping && (
-              <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+              <div style={{ display: 'flex', flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginBottom: 16 }}>
                 <div style={{
                   width: 24,
                   height: 24,
@@ -615,23 +639,32 @@ export default function HomePage() {
                   alignItems: 'center',
                   justifyContent: 'center',
                   fontSize: 12,
-                  fontWeight: 600
+                  fontWeight: 600,
+                  flexShrink: 0,
+                  boxShadow: '0 0 8px rgba(0, 210, 160, 0.4)',
+                  animation: 'glow 2s ease-in-out infinite'
                 }}>
                   ✦
                 </div>
                 <div style={{
+                  maxWidth: '75%',
                   padding: '10px 14px',
                   borderRadius: 12,
                   backgroundColor: 'transparent',
-                  color: '#666',
+                  color: '#E5E5E5',
                   fontSize: 16,
-                  display: 'flex',
-                  gap: 6,
-                  alignItems: 'center'
+                  lineHeight: 1.5,
+                  whiteSpace: 'pre-wrap'
                 }}>
-                  <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0s', color: '#fff' }}>●</span>
-                  <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0.2s', color: '#fff' }}>●</span>
-                  <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0.4s', color: '#fff' }}>●</span>
+                  {streamingContent ? (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{streamingContent}</ReactMarkdown>
+                  ) : (
+                    <span style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0s', color: '#fff' }}>●</span>
+                      <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0.2s', color: '#fff' }}>●</span>
+                      <span style={{ animation: 'dotPulse 1.2s infinite', animationDelay: '0.4s', color: '#fff' }}>●</span>
+                    </span>
+                  )}
                 </div>
               </div>
             )}

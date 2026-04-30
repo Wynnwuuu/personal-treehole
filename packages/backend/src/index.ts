@@ -2,7 +2,7 @@ import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
 import { createClient } from '@supabase/supabase-js'
-import { chat, analyzeEvent } from './services/deepseek'
+import { chat, analyzeEvent, chatStream } from './services/deepseek'
 import { sendEmail, generateVerifyEmailHtml, generateInvitationCode } from './services/email'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
@@ -175,7 +175,8 @@ app.post('/api/auth/signup', async (req, res) => {
     to: email,
     subject: '【心灵树洞】请验证您的邮箱',
     html,
-    text
+    text,
+    templateData: { name: '树洞的朋友' }
   })
 
   res.json({
@@ -265,7 +266,7 @@ app.post('/api/auth/test-email', async (req, res) => {
   }
   const token = crypto.randomBytes(32).toString('hex')
   const { html, text } = generateVerifyEmailHtml(token)
-  const sent = await sendEmail({ to: email, subject: '✧ 验证你的邮箱 ✧', html, text })
+  const sent = await sendEmail({ to: email, subject: '✧ 验证你的邮箱 ✧', html, text, templateData: { name: '树洞的朋友' } })
   if (sent) {
     res.json({ success: true, message: '测试邮件已发送' })
   } else {
@@ -321,7 +322,8 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     to: email,
     subject: '【心灵树洞】请验证您的邮箱',
     html,
-    text
+    text,
+    templateData: { name: '树洞的朋友' }
   })
 
   res.json({ success: true, message: '验证邮件已发送。' })
@@ -577,9 +579,182 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
   }
 
   res.json({
-    userMessage,
+userMessage,
     assistantMessage
   })
+})
+
+// 发送消息并获取 AI 回复（流式版本）
+app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthRequest, res) => {
+  const userId = req.body.userId
+  const sessionId = req.params.id
+  const { content } = req.body
+
+  console.log('[API] /api/sessions/:id/messages/stream called', { userId, sessionId, content: content?.slice(0, 50) })
+
+  if (!content?.trim()) {
+    return res.status(400).json({ error: '消息内容不能为空。' })
+  }
+
+  // 验证会话属于该用户
+  const { data: session, error: sessionError } = await supabase
+    .from('sessions')
+    .select('id, title, started_at')
+    .eq('id', sessionId)
+    .eq('user_id', userId)
+    .single()
+
+  if (sessionError || !session) {
+    return res.status(404).json({ error: '会话不存在或无权访问。' })
+  }
+
+  // 获取会话历史
+  const { data: historyData } = await supabase
+    .from('entries')
+    .select('role, content')
+    .eq('session_id', sessionId)
+    .eq('is_stale', false)
+    .order('created_at', { ascending: true })
+
+  const sessionHistory = (historyData || []).map((entry: any) => ({
+    role: entry.role as 'user' | 'assistant',
+    content: entry.content
+  }))
+
+  // 获取情绪背景
+  const oneWeekAgo = new Date()
+  oneWeekAgo.setDate(oneWeekAgo.getDate() - 7)
+
+  const [allMoods, recentMoods] = await Promise.all([
+    supabase.from('moods').select('events_mentioned, entry_id').eq('user_id', userId),
+    supabase
+      .from('moods')
+      .select('sentiment_score, energy_level, stress_level')
+      .eq('user_id', userId)
+      .gte('created_at', oneWeekAgo.toISOString())
+  ])
+
+  const allEvents: string[] = []
+  if (allMoods.data) {
+    allMoods.data.forEach(m => {
+      if (m.events_mentioned) allEvents.push(...m.events_mentioned)
+    })
+  }
+
+  let avgSentiment = 0.5, avgEnergy = 0.5, avgStress = 0.5
+  if (recentMoods.data && recentMoods.data.length > 0) {
+    avgSentiment = recentMoods.data.reduce((s, m) => s + m.sentiment_score, 0) / recentMoods.data.length
+    avgEnergy = recentMoods.data.reduce((s, m) => s + m.energy_level, 0) / recentMoods.data.length
+    avgStress = recentMoods.data.reduce((s, m) => s + m.stress_level, 0) / recentMoods.data.length
+  }
+
+  const moodContext = {
+    events_mentioned: [...new Set(allEvents)],
+    sentiment_score: avgSentiment,
+    energy_level: avgEnergy,
+    stress_level: avgStress
+  }
+
+  // 存储用户消息
+  const { data: userMessage, error: userMsgError } = await supabase
+    .from('entries')
+    .insert({
+      user_id: userId,
+      session_id: sessionId,
+      content,
+      role: 'user',
+      user_timestamp: new Date().toISOString(),
+      event_timestamp: new Date().toISOString()
+    })
+    .select()
+    .single()
+
+  if (userMsgError) return res.status(400).json({ error: userMsgError.message })
+
+  // 设置 SSE 响应头
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+
+  // 先发送用户消息 ID
+  res.write(`data: ${JSON.stringify({ type: 'userMessage', data: userMessage })}\n\n`)
+
+  // 构建最近 20 条历史
+  const recentHistory = sessionHistory.slice(-20)
+
+  try {
+    let fullResponse = ''
+    for await (const chunk of chatStream(recentHistory, content, moodContext)) {
+      fullResponse += chunk
+      res.write(`data: ${JSON.stringify({ type: 'chunk', data: chunk })}\n\n`)
+    }
+
+    // 存储 AI 回复
+    const { data: assistantMessage, error: assistantMsgError } = await supabase
+      .from('entries')
+      .insert({
+        user_id: userId,
+        session_id: sessionId,
+        content: fullResponse,
+        role: 'assistant'
+      })
+      .select()
+      .single()
+
+    if (assistantMsgError) {
+      res.write(`data: ${JSON.stringify({ type: 'error', data: assistantMsgError.message })}\n\n`)
+    } else {
+      res.write(`data: ${JSON.stringify({ type: 'assistantMessage', data: assistantMessage })}\n\n`)
+    }
+
+    // 情绪分析
+    try {
+      const eventAnalysis = await analyzeEvent(content)
+      await supabase.from('moods').insert({
+        entry_id: userMessage.id,
+        user_id: userId,
+        sentiment_score: eventAnalysis.sentiment_score,
+        primary_mood: eventAnalysis.mood,
+        mood_tags: eventAnalysis.events_mentioned,
+        energy_level: eventAnalysis.energy_level,
+        stress_level: eventAnalysis.stress_level,
+        events_mentioned: eventAnalysis.events_mentioned,
+        event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+      })
+      await supabase
+        .from('entries')
+        .update({
+          event_data: {
+            mood: eventAnalysis.mood,
+            sentiment_score: eventAnalysis.sentiment_score,
+            energy_level: eventAnalysis.energy_level,
+            stress_level: eventAnalysis.stress_level,
+            events_mentioned: eventAnalysis.events_mentioned,
+            event_timestamp: eventAnalysis.event_timestamp
+          },
+          event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+        })
+        .eq('id', userMessage.id)
+    } catch (error) {
+      console.error('情绪分析错误:', error)
+    }
+
+    // 更新会话标题
+    if (!session.title || session.title === '新的对话') {
+      const firstContent = content.slice(0, 30)
+      await supabase
+        .from('sessions')
+        .update({ title: firstContent + (content.length > 30 ? '...' : '') })
+        .eq('id', sessionId)
+    }
+
+    res.write('data: [DONE]\n\n')
+    res.end()
+  } catch (error) {
+    console.error('[API] Stream error:', error)
+    res.write(`data: ${JSON.stringify({ type: 'error', data: '流式响应出错' })}\n\n`)
+    res.end()
+  }
 })
 
 // 删除会话

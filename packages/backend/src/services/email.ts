@@ -7,14 +7,24 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@resend.dev'
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000'
 
+const TENCENT_SECRET_ID = process.env.TENCENT_SECRET_ID || ''
+const TENCENT_SECRET_KEY = process.env.TENCENT_SECRET_KEY || ''
+const TENCENT_SES_SENDER_EMAIL = process.env.TENCENT_SES_SENDER_EMAIL || ''
+const TENCENT_SES_TEMPLATE_ID = process.env.TENCENT_SES_TEMPLATE_ID || ''
+
 interface SendEmailParams {
   to: string
   subject: string
   html: string
   text: string
+  templateData?: Record<string, string>
 }
 
-export async function sendEmail({ to, subject, html, text }: SendEmailParams): Promise<boolean> {
+export async function sendEmail({ to, subject, html, text, templateData }: SendEmailParams): Promise<boolean> {
+  if (templateData && TENCENT_SECRET_ID && TENCENT_SECRET_KEY && TENCENT_SES_SENDER_EMAIL && TENCENT_SES_TEMPLATE_ID) {
+    return sendViaTencentSES(to, subject, templateData)
+  }
+
   if (!RESEND_API_KEY) {
     console.warn('[Email] RESEND_API_KEY not configured, skipping email send')
     console.log('[Email] Would have sent:', { to, subject })
@@ -51,8 +61,41 @@ export async function sendEmail({ to, subject, html, text }: SendEmailParams): P
   }
 }
 
+async function sendViaTencentSES(to: string, subject: string, templateData: Record<string, string>): Promise<boolean> {
+  const tencentcloud = require('tencentcloud-sdk-nodejs')
+
+  const SESClient = tencentcloud.ses.v20201002.Client
+
+  const client = new SESClient({
+    credential: {
+      secretId: TENCENT_SECRET_ID,
+      secretKey: TENCENT_SECRET_KEY
+    },
+    region: 'ap-hongkong'
+  })
+
+  try {
+    const result = await client.SendEmail({
+      FromEmailAddress: TENCENT_SES_SENDER_EMAIL,
+      Destination: [to],
+      Subject: subject,
+      Template: {
+        TemplateID: parseInt(TENCENT_SES_TEMPLATE_ID, 10),
+        TemplateData: JSON.stringify(templateData)
+      },
+      TriggerType: 1
+    })
+
+    console.log('[Email] Sent via Tencent SES successfully to:', to, JSON.stringify(result))
+    return true
+  } catch (error) {
+    console.error('[Email] Tencent SES send failed:', error)
+    return false
+  }
+}
+
 export function generateVerifyEmailHtml(token: string): { html: string; text: string } {
-  const verifyUrl = `${FRONTEND_URL}/login?token=${token}`
+  const verifyUrl = `${FRONTEND_URL}/verify-email/${token}`
 
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
