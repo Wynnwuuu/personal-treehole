@@ -193,7 +193,7 @@ export function sendMessageStream(sessionId: string, content: string, callbacks:
       const reader = response.body?.getReader()
       if (!reader) {
         callbacks.onError?.('No response body')
-        return
+        return () => {}
       }
 
       const decoder = new TextDecoder()
