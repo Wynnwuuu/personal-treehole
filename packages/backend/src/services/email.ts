@@ -1,7 +1,7 @@
 import dotenv from 'dotenv'
 import * as path from 'path'
 
-dotenv.config({ path: path.join(__dirname, '../.env') })
+dotenv.config({ path: path.join(__dirname, '../../.env') })
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000'
 
@@ -9,6 +9,13 @@ const TENCENT_SECRET_ID = process.env.TENCENT_SECRET_ID || ''
 const TENCENT_SECRET_KEY = process.env.TENCENT_SECRET_KEY || ''
 const TENCENT_SES_SENDER_EMAIL = process.env.TENCENT_SES_SENDER_EMAIL || ''
 const TENCENT_SES_TEMPLATE_ID = process.env.TENCENT_SES_TEMPLATE_ID || ''
+
+console.log('[Email] Tencent config loaded:', {
+  hasSecretId: !!TENCENT_SECRET_ID,
+  hasSecretKey: !!TENCENT_SECRET_KEY,
+  hasSenderEmail: !!TENCENT_SES_SENDER_EMAIL,
+  hasTemplateId: !!TENCENT_SES_TEMPLATE_ID
+})
 
 interface SendEmailParams {
   to: string
@@ -42,7 +49,7 @@ async function sendViaTencentSES(to: string, subject: string, templateData: Reco
       secretId: TENCENT_SECRET_ID,
       secretKey: TENCENT_SECRET_KEY
     },
-    region: 'ap-guangzhou'
+    region: 'ap-hongkong'
   })
 
   try {
