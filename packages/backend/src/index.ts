@@ -1,15 +1,17 @@
+import dotenv from 'dotenv'
+import * as path from 'path'
+
+dotenv.config({ path: path.join(__dirname, '../.env') })
+
 import express from 'express'
 import cors from 'cors'
-import dotenv from 'dotenv'
 import { createClient } from '@supabase/supabase-js'
 import { chat, analyzeEvent, chatStream } from './services/deepseek'
 import { sendEmail, generateVerifyEmailHtml, generateInvitationCode } from './services/email'
+import { encrypt, decrypt, isEncrypted } from './services/crypto'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
-import * as path from 'path'
 import crypto from 'crypto'
-
-dotenv.config({ path: path.join(__dirname, '../.env') })
 
 const app = express()
 app.use(cors())
@@ -176,7 +178,7 @@ app.post('/api/auth/signup', async (req, res) => {
     subject: '【心灵树洞】请验证您的邮箱',
     html,
     text,
-    templateData: { name: '树洞的朋友' }
+    templateData: { name: verifyToken }
   })
 
   res.json({
@@ -266,7 +268,7 @@ app.post('/api/auth/test-email', async (req, res) => {
   }
   const token = crypto.randomBytes(32).toString('hex')
   const { html, text } = generateVerifyEmailHtml(token)
-  const sent = await sendEmail({ to: email, subject: '✧ 验证你的邮箱 ✧', html, text, templateData: { name: '树洞的朋友' } })
+  const sent = await sendEmail({ to: email, subject: '✧ 验证你的邮箱 ✧', html, text, templateData: { name: token } })
   if (sent) {
     res.json({ success: true, message: '测试邮件已发送' })
   } else {
@@ -323,7 +325,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     subject: '【心灵树洞】请验证您的邮箱',
     html,
     text,
-    templateData: { name: '树洞的朋友' }
+    templateData: { name: verifyToken }
   })
 
   res.json({ success: true, message: '验证邮件已发送。' })
@@ -369,6 +371,8 @@ app.get('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res)
   const userId = req.body.userId
   const sessionId = req.params.id
 
+  console.log('[API] GET /api/sessions/:id/messages', { userId, sessionId, auth: req.headers.authorization?.slice(0, 20) })
+
   // 验证会话属于该用户
   const { data: session, error: sessionError } = await supabase
     .from('sessions')
@@ -389,7 +393,21 @@ app.get('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res)
     .order('created_at', { ascending: true })
 
   if (error) return res.status(400).json({ error: error.message })
-  res.json(data)
+
+  // 解密用户消息（如果解密失败则保留原文，不影响业务流程）
+  const decryptedData = (data || []).map((entry: any) => {
+    if (entry.role === 'user' && isEncrypted(entry.content)) {
+      try {
+        return { ...entry, content: decrypt(entry.content) }
+      } catch (e) {
+        console.log('[API] 解密旧消息失败，保留密文:', entry.id)
+        return { ...entry, content: '[此消息内容暂时无法显示]' }
+      }
+    }
+    return entry
+  })
+
+  res.json(decryptedData)
 })
 
 // 发送消息并获取 AI 回复
@@ -428,10 +446,17 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
 
   console.log('[API] History data:', historyData)
 
-  const sessionHistory = (historyData || []).map((entry: any) => ({
-    role: entry.role as 'user' | 'assistant',
-    content: entry.content
-  }))
+  const sessionHistory = (historyData || []).map((entry: any) => {
+    if (entry.role === 'user' && isEncrypted(entry.content)) {
+      try {
+        return { role: entry.role as 'user' | 'assistant', content: decrypt(entry.content) }
+      } catch (e) {
+        console.log('[API] 解密历史消息失败，跳过:', entry.id)
+        return null
+      }
+    }
+    return { role: entry.role as 'user' | 'assistant', content: entry.content }
+  }).filter(Boolean)
 
   // 获取用户情绪背景（从 moods 表）
   // events_mentioned: 全量历史数据（排除已删除消息的事件）
@@ -476,13 +501,13 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
     stress_level: avgStress
   }
 
-  // 存储用户消息
+  // 存储用户消息（加密）
   const { data: userMessage, error: userMsgError } = await supabase
     .from('entries')
     .insert({
       user_id: userId,
       session_id: sessionId,
-      content,
+      content: encrypt(content),
       role: 'user',
       user_timestamp: new Date().toISOString(),
       event_timestamp: new Date().toISOString()
@@ -579,7 +604,10 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
   }
 
   res.json({
-userMessage,
+    userMessage: {
+      ...userMessage,
+      content: decrypt(userMessage.content)
+    },
     assistantMessage
   })
 })
@@ -616,10 +644,17 @@ app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthReque
     .eq('is_stale', false)
     .order('created_at', { ascending: true })
 
-  const sessionHistory = (historyData || []).map((entry: any) => ({
-    role: entry.role as 'user' | 'assistant',
-    content: entry.content
-  }))
+  const sessionHistory = (historyData || []).map((entry: any) => {
+    if (entry.role === 'user' && isEncrypted(entry.content)) {
+      try {
+        return { role: entry.role as 'user' | 'assistant', content: decrypt(entry.content) }
+      } catch (e) {
+        console.log('[API] 解密历史消息失败，跳过:', entry.id)
+        return null
+      }
+    }
+    return { role: entry.role as 'user' | 'assistant', content: entry.content }
+  }).filter(Boolean)
 
   // 获取情绪背景
   const oneWeekAgo = new Date()
@@ -655,13 +690,13 @@ app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthReque
     stress_level: avgStress
   }
 
-  // 存储用户消息
+  // 存储用户消息（加密）
   const { data: userMessage, error: userMsgError } = await supabase
     .from('entries')
     .insert({
       user_id: userId,
       session_id: sessionId,
-      content,
+      content: encrypt(content),
       role: 'user',
       user_timestamp: new Date().toISOString(),
       event_timestamp: new Date().toISOString()
@@ -676,8 +711,12 @@ app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthReque
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('Connection', 'keep-alive')
 
-  // 先发送用户消息 ID
-  res.write(`data: ${JSON.stringify({ type: 'userMessage', data: userMessage })}\n\n`)
+  // 先发送用户消息 ID（解密后）
+  const decryptedUserMessage = {
+    ...userMessage,
+    content: decrypt(userMessage.content)
+  }
+  res.write(`data: ${JSON.stringify({ type: 'userMessage', data: decryptedUserMessage })}\n\n`)
 
   // 构建最近 20 条历史
   const recentHistory = sessionHistory.slice(-20)
@@ -708,35 +747,52 @@ app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthReque
     }
 
     // 情绪分析
+    let eventAnalysisResult = null
     try {
-      const eventAnalysis = await analyzeEvent(content)
+      eventAnalysisResult = await analyzeEvent(content)
       await supabase.from('moods').insert({
         entry_id: userMessage.id,
         user_id: userId,
-        sentiment_score: eventAnalysis.sentiment_score,
-        primary_mood: eventAnalysis.mood,
-        mood_tags: eventAnalysis.events_mentioned,
-        energy_level: eventAnalysis.energy_level,
-        stress_level: eventAnalysis.stress_level,
-        events_mentioned: eventAnalysis.events_mentioned,
-        event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+        sentiment_score: eventAnalysisResult.sentiment_score,
+        primary_mood: eventAnalysisResult.mood,
+        mood_tags: eventAnalysisResult.events_mentioned,
+        energy_level: eventAnalysisResult.energy_level,
+        stress_level: eventAnalysisResult.stress_level,
+        events_mentioned: eventAnalysisResult.events_mentioned,
+        event_timestamp: eventAnalysisResult.event_timestamp ? new Date().toISOString() : null
       })
       await supabase
         .from('entries')
         .update({
           event_data: {
-            mood: eventAnalysis.mood,
-            sentiment_score: eventAnalysis.sentiment_score,
-            energy_level: eventAnalysis.energy_level,
-            stress_level: eventAnalysis.stress_level,
-            events_mentioned: eventAnalysis.events_mentioned,
-            event_timestamp: eventAnalysis.event_timestamp
+            mood: eventAnalysisResult.mood,
+            sentiment_score: eventAnalysisResult.sentiment_score,
+            energy_level: eventAnalysisResult.energy_level,
+            stress_level: eventAnalysisResult.stress_level,
+            events_mentioned: eventAnalysisResult.events_mentioned,
+            event_timestamp: eventAnalysisResult.event_timestamp
           },
-          event_timestamp: eventAnalysis.event_timestamp ? new Date().toISOString() : null
+          event_timestamp: eventAnalysisResult.event_timestamp ? new Date().toISOString() : null
         })
         .eq('id', userMessage.id)
     } catch (error) {
       console.error('情绪分析错误:', error)
+    }
+
+    // 发送更新后的用户消息（包含 event_data）
+    if (eventAnalysisResult) {
+      const updatedUserMessage = {
+        ...userMessage,
+        event_data: {
+          mood: eventAnalysisResult.mood,
+          sentiment_score: eventAnalysisResult.sentiment_score,
+          energy_level: eventAnalysisResult.energy_level,
+          stress_level: eventAnalysisResult.stress_level,
+          events_mentioned: eventAnalysisResult.events_mentioned,
+          event_timestamp: eventAnalysisResult.event_timestamp
+        }
+      }
+      res.write(`data: ${JSON.stringify({ type: 'eventDataUpdate', data: updatedUserMessage })}\n\n`)
     }
 
     // 更新会话标题
@@ -943,10 +999,17 @@ app.post('/api/sessions/:id/edit', verifyToken, async (req: AuthRequest, res) =>
     .eq('is_stale', false)
     .order('created_at', { ascending: true })
 
-  const sessionHistory = (historyData || []).map((e: any) => ({
-    role: e.role as 'user' | 'assistant',
-    content: e.content
-  }))
+  const sessionHistory = (historyData || []).map((e: any) => {
+    if (e.role === 'user' && isEncrypted(e.content)) {
+      try {
+        return { role: e.role as 'user' | 'assistant', content: decrypt(e.content) }
+      } catch (e) {
+        console.log('[API] 解密历史消息失败，跳过:', e)
+        return null
+      }
+    }
+    return { role: e.role as 'user' | 'assistant', content: e.content }
+  }).filter(Boolean)
 
   // 调用 AI
   const recentHistory = sessionHistory.slice(-20)

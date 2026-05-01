@@ -1,4 +1,6 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:4000'
+const API_BASE_URL = (typeof window !== 'undefined' && !process.env.NEXT_PUBLIC_API_BASE_URL)
+  ? ''
+  : (process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:4000')
 const STORAGE_KEY = 'personal-treehole-token'
 
 export interface Mood {
@@ -173,6 +175,7 @@ export function sendMessageStream(sessionId: string, content: string, callbacks:
   onAssistantMessage?: (message: Message) => void
   onError?: (error: string) => void
   onDone?: () => void
+  onEventDataUpdate?: (message: Message) => void
 }): () => void {
   const token = getStoredToken()
   const abortController = new AbortController()
@@ -223,6 +226,8 @@ export function sendMessageStream(sessionId: string, content: string, callbacks:
                   callbacks.onAssistantMessage?.(data.data)
                 } else if (data.type === 'error') {
                   callbacks.onError?.(data.data)
+                } else if (data.type === 'eventDataUpdate') {
+                  callbacks.onEventDataUpdate?.(data.data)
                 } else if (data === '[DONE]') {
                   callbacks.onDone?.()
                 }

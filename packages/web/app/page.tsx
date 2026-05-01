@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAuth } from '../hooks/useAuth'
-import { fetchMessages, sendMessage, sendMessageStream, createSession, searchMessages, updateMessage, editMessage, SearchResult, Message } from '../lib/api'
+import { fetchMessages, sendMessage, sendMessageStream, createSession, fetchSessions, searchMessages, updateMessage, editMessage, SearchResult, Message } from '../lib/api'
 
 const SESSION_KEY = 'personal-treehole-session-id'
 
@@ -110,6 +110,11 @@ export default function HomePage() {
       if (storedSessionId) {
         try {
           const historicalMessages = await fetchMessages(storedSessionId)
+          // 如果返回空数组且 session title 是"新的对话"，说明这是个空会话，查找其他有内容的会话
+          const sessionTitle = (globalThis as any).__sessionTitle || '新的对话'
+          if ((!historicalMessages || historicalMessages.length === 0) && sessionTitle === '新的对话') {
+            throw new Error('空会话，查找其他会话')
+          }
           setSessionId(storedSessionId)
           setMessages(historicalMessages || [])
 
@@ -164,10 +169,33 @@ export default function HomePage() {
           setIsInitialLoading(false)
           return
         } catch (e) {
-          console.log('历史记录加载失败，创建新会话')
+          console.log('历史记录加载失败，查找最近的有消息的会话', e)
+          // 加载失败时，查找用户最近一个有消息的会话
+          try {
+            const sessions = await fetchSessions()
+            // 按时间倒序找有消息的会话
+            for (const session of sessions) {
+              const msgs = await fetchMessages(session.id)
+              if (msgs && msgs.length > 0) {
+                localStorage.setItem(SESSION_KEY, session.id)
+                setSessionId(session.id)
+                setMessages(msgs)
+                setIsInitialLoading(false)
+                return
+              }
+            }
+          } catch (e2) {
+            console.log('查找会话列表也失败:', e2)
+          }
+          // 如果所有方法都失败，保留 sessionId 但清空消息
+          setSessionId(storedSessionId)
+          setMessages([])
+          setIsInitialLoading(false)
+          return
         }
       }
 
+      // 没有存储的 sessionId 时才创建新会话
       const session = await createSession()
       localStorage.setItem(SESSION_KEY, session.id)
       setSessionId(session.id)
@@ -233,6 +261,10 @@ export default function HomePage() {
           setError(errorMsg)
           setMessages(prev => prev.filter(m => m.id !== tempUserMessage.id))
         }
+      },
+      onEventDataUpdate: (msg) => {
+        // 更新消息的 event_data
+        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, event_data: msg.event_data } : m))
       },
       onDone: () => {
         if (cancelRef.current) {
