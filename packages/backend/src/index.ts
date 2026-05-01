@@ -456,7 +456,7 @@ app.post('/api/sessions/:id/messages', verifyToken, async (req: AuthRequest, res
       }
     }
     return { role: entry.role as 'user' | 'assistant', content: entry.content }
-  }).filter(Boolean)
+  }).filter((x): x is { role: 'user' | 'assistant'; content: string } => x !== null)
 
   // 获取用户情绪背景（从 moods 表）
   // events_mentioned: 全量历史数据（排除已删除消息的事件）
@@ -654,7 +654,7 @@ app.post('/api/sessions/:id/messages/stream', verifyToken, async (req: AuthReque
       }
     }
     return { role: entry.role as 'user' | 'assistant', content: entry.content }
-  }).filter(Boolean)
+  }).filter((x): x is { role: 'user' | 'assistant'; content: string } => x !== null)
 
   // 获取情绪背景
   const oneWeekAgo = new Date()
